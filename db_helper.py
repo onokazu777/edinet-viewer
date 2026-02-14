@@ -54,13 +54,19 @@ def get_db_stats() -> dict:
             "SELECT COUNT(DISTINCT sec_code) FROM documents WHERE sec_code IS NOT NULL AND sec_code != ''"
         ).fetchone()[0]
         # 解析済み
-        stats["parsed_docs"] = conn.execute(
-            "SELECT COUNT(*) FROM documents WHERE parse_status = 1"
-        ).fetchone()[0]
+        try:
+            stats["parsed_docs"] = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE parse_status = 1"
+            ).fetchone()[0]
+        except Exception:
+            stats["parsed_docs"] = 0
         # DL 済み
-        stats["downloaded_docs"] = conn.execute(
-            "SELECT COUNT(*) FROM documents WHERE dl_status > 0"
-        ).fetchone()[0]
+        try:
+            stats["downloaded_docs"] = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE dl_status > 0"
+            ).fetchone()[0]
+        except Exception:
+            stats["downloaded_docs"] = 0
         # 財務レコード数（key_financials テーブル or financials テーブル）
         try:
             stats["financial_records"] = conn.execute(
@@ -153,8 +159,7 @@ def get_company_documents(sec_code: str) -> pd.DataFrame:
     return _query_df("""
         SELECT
             doc_id, filer_name, doc_type_code, doc_description,
-            period_start, period_end, submit_date, file_date,
-            dl_status, parse_status
+            period_start, period_end, submit_date, file_date
         FROM documents
         WHERE sec_code = ?
         ORDER BY file_date DESC
@@ -327,8 +332,7 @@ def get_recent_documents(limit: int = 30) -> pd.DataFrame:
             doc_id, sec_code, filer_name,
             doc_type_code, doc_description,
             period_start, period_end,
-            submit_date, file_date,
-            parse_status
+            submit_date, file_date
         FROM documents
         WHERE sec_code IS NOT NULL AND sec_code != ''
         ORDER BY file_date DESC, submit_date DESC

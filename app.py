@@ -106,14 +106,15 @@ with col1:
 with col2:
     st.metric("書類数", f"{stats['total_docs']:,}")
 with col3:
-    st.metric("解析済み", f"{stats['parsed_docs']:,}")
+    st.metric("財務データ", f"{stats['financial_records']:,}")
 with col4:
-    st.metric("財務レコード", f"{stats['financial_records']:,}")
-with col5:
     st.metric("テキストブロック", f"{stats['text_blocks']:,}")
+with col5:
+    st.metric("データ期間", f"{stats.get('date_from', '')[:7]}～")
 
 if stats["date_from"] and stats["date_to"]:
-    st.caption(f"データ期間: {stats['date_from']} ～ {stats['date_to']}")
+    st.caption(f"データ期間: {stats['date_from']} ～ {stats['date_to']}　|　"
+               f"出典: EDINET（金融庁 電子開示システム）")
 
 # ── 書類種別の内訳 ────────────────────────────────────
 

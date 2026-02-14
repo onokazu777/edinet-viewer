@@ -312,13 +312,10 @@ with tab_docs:
         docs["書類種別"] = docs["doc_type_code"].map(
             lambda x: db.DOC_TYPE_NAMES.get(x, x)
         )
-        docs["解析状態"] = docs["parse_status"].map(
-            {0: "未解析", 1: "解析済み", -1: "エラー"}
-        )
 
         display_docs = docs[[
             "file_date", "書類種別", "doc_description",
-            "period_start", "period_end", "解析状態",
+            "period_start", "period_end",
         ]].rename(columns={
             "file_date": "提出日",
             "doc_description": "概要",
