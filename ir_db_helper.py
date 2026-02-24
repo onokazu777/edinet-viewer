@@ -149,6 +149,25 @@ def init_ir_tables():
             )
         """)
 
+        # グラフマッピング（F-02: Excelデータ→スライド・グラフの紐付け）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ir_graph_mappings (
+                mapping_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                data_id INTEGER NOT NULL,
+                slide_number INTEGER NOT NULL,
+                graph_name TEXT NOT NULL,
+                graph_type TEXT NOT NULL DEFAULT 'bar',
+                x_column TEXT,
+                y_columns_json TEXT,
+                chart_config_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES ir_projects(project_id),
+                FOREIGN KEY (data_id) REFERENCES ir_excel_data(data_id)
+            )
+        """)
+
         conn.commit()
     finally:
         conn.close()
@@ -218,6 +237,7 @@ def update_project_status(project_id: int, status: str):
 def delete_project(project_id: int):
     conn = _get_conn()
     try:
+        conn.execute("DELETE FROM ir_graph_mappings WHERE project_id = ?", (project_id,))
         conn.execute("DELETE FROM ir_learning_rules WHERE project_id = ?", (project_id,))
         conn.execute("DELETE FROM ir_suggestions WHERE project_id = ?", (project_id,))
         conn.execute("DELETE FROM ir_image_placements WHERE project_id = ?", (project_id,))
@@ -306,6 +326,71 @@ def get_project_excel_data(project_id: int) -> pd.DataFrame:
         "SELECT * FROM ir_excel_data WHERE project_id = ? ORDER BY data_id",
         (project_id,),
     )
+
+
+# ── グラフマッピング操作（F-02）─────────────────────
+
+def save_graph_mapping(project_id: int, data_id: int, slide_number: int,
+                       graph_name: str, graph_type: str,
+                       x_column: str, y_columns: list[str],
+                       chart_config: dict = None) -> int:
+    conn = _get_conn()
+    try:
+        cursor = conn.execute(
+            """INSERT INTO ir_graph_mappings
+               (project_id, data_id, slide_number, graph_name, graph_type,
+                x_column, y_columns_json, chart_config_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, data_id, slide_number, graph_name, graph_type,
+             x_column, json.dumps(y_columns, ensure_ascii=False),
+             json.dumps(chart_config or {}, ensure_ascii=False)),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_project_graph_mappings(project_id: int) -> pd.DataFrame:
+    return _query_df(
+        """SELECT gm.*, ed.label as data_label, ed.sheet_name
+           FROM ir_graph_mappings gm
+           JOIN ir_excel_data ed ON gm.data_id = ed.data_id
+           WHERE gm.project_id = ?
+           ORDER BY gm.slide_number, gm.mapping_id""",
+        (project_id,),
+    )
+
+
+def update_graph_mapping(mapping_id: int, slide_number: int,
+                         graph_name: str, graph_type: str,
+                         x_column: str, y_columns: list[str],
+                         chart_config: dict = None):
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE ir_graph_mappings
+               SET slide_number = ?, graph_name = ?, graph_type = ?,
+                   x_column = ?, y_columns_json = ?, chart_config_json = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE mapping_id = ?""",
+            (slide_number, graph_name, graph_type,
+             x_column, json.dumps(y_columns, ensure_ascii=False),
+             json.dumps(chart_config or {}, ensure_ascii=False),
+             mapping_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_graph_mapping(mapping_id: int):
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM ir_graph_mappings WHERE mapping_id = ?", (mapping_id,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ── AI指摘操作 ───────────────────────────────────────

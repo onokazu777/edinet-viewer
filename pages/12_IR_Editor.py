@@ -4,6 +4,8 @@ Insight Arc — F-02/F-04/F-06 データ分析・グラフ同期エディタ
 
 Excel データとグラフの動的連動、5年トレンド分析、
 スケーリング表示を行うページ。
+
+F-02: Excelシート → スライド・グラフへのマッピング設定
 """
 
 import json
@@ -33,6 +35,69 @@ ai = MockAIEngine()
 # ── グラフ高さ制約（仕様: 配置固定）──────────────────
 CHART_HEIGHT_MAIN = 450
 CHART_HEIGHT_SUB = 350
+
+GRAPH_TYPE_OPTIONS = {
+    "bar": "棒グラフ",
+    "line": "折れ線グラフ",
+    "bar_line": "棒＋折れ線（売上・利益向け）",
+    "area": "エリアチャート",
+    "grouped_bar": "グループ棒グラフ",
+}
+
+
+def _build_chart(graph_type: str, df: pd.DataFrame,
+                 x_col: str, y_cols: list[str],
+                 title: str = "", height: int = CHART_HEIGHT_MAIN) -> go.Figure:
+    """マッピング設定からPlotlyチャートを生成"""
+    colors = ["#1a73e8", "#e53935", "#43a047", "#f9a825", "#7b1fa2"]
+
+    if graph_type == "bar_line" and len(y_cols) >= 2:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Bar(x=df[x_col], y=df[y_cols[0]], name=y_cols[0],
+                   marker_color=colors[0], opacity=0.7),
+            secondary_y=False,
+        )
+        for i, col in enumerate(y_cols[1:], 1):
+            fig.add_trace(
+                go.Scatter(x=df[x_col], y=df[col], name=col,
+                           mode="lines+markers",
+                           line=dict(color=colors[i % len(colors)], width=3)),
+                secondary_y=True,
+            )
+        fig.update_yaxes(title_text=y_cols[0], secondary_y=False)
+        fig.update_yaxes(title_text="副軸", secondary_y=True)
+    else:
+        fig = go.Figure()
+        for i, col in enumerate(y_cols):
+            if graph_type == "line":
+                fig.add_trace(go.Scatter(
+                    x=df[x_col], y=df[col], name=col,
+                    mode="lines+markers",
+                    line=dict(color=colors[i % len(colors)], width=3),
+                ))
+            elif graph_type == "area":
+                fig.add_trace(go.Scatter(
+                    x=df[x_col], y=df[col], name=col,
+                    mode="lines", fill="tonexty",
+                    line=dict(color=colors[i % len(colors)]),
+                ))
+            else:  # bar / grouped_bar
+                fig.add_trace(go.Bar(
+                    x=df[x_col], y=df[col], name=col,
+                    marker_color=colors[i % len(colors)],
+                ))
+
+        if graph_type in ("bar", "grouped_bar"):
+            fig.update_layout(barmode="group")
+
+    fig.update_layout(
+        title=title, height=height,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(t=80, b=40),
+    )
+    return fig
+
 
 # ── プロジェクト選択 ──────────────────────────────────
 params = st.query_params
@@ -65,295 +130,273 @@ project = ir_db.get_project(project_id)
 
 st.title(f"データ分析・グラフ同期 — {project['title']}")
 
-# ── データソース選択 ──────────────────────────────────
+# ── データソース一覧を取得 ────────────────────────────
+
+excel_data = ir_db.get_project_excel_data(project_id)
+
+# EDINET データも取得してデータソース一覧に追加
+edinet_data_id = None  # EDINET用の仮ID
+edinet_df = pd.DataFrame()
+sec_code = project.get("sec_code", "")
+
+if sec_code:
+    edinet_fin = db.get_key_financials(sec_code)
+    if not edinet_fin.empty:
+        if 1 in edinet_fin["is_consolidated"].values:
+            edinet_fin = edinet_fin[edinet_fin["is_consolidated"] == 1]
+        edinet_fin = edinet_fin.sort_values("period_end")
+        if len(edinet_fin) > 20:
+            edinet_fin = edinet_fin.tail(20)
+        yen_cols = ["sales", "operating_income", "ordinary_income", "net_income",
+                    "total_assets", "net_assets",
+                    "operating_cf", "investing_cf", "financing_cf"]
+        for col in yen_cols:
+            if col in edinet_fin.columns:
+                edinet_fin[col] = edinet_fin[col] / 1e8
+        edinet_df = edinet_fin
+
+# ══════════════════════════════════════════════════════
+#  セクション1: データソース確認
+# ══════════════════════════════════════════════════════
 
 st.markdown("### データソース")
 
 tab_excel, tab_edinet = st.tabs(["📁 アップロードExcel", "📊 EDINET データ"])
 
-# データを保持するためのセッション変数
-analysis_df = pd.DataFrame()
-
-# ── タブ1: アップロードExcelデータ ────────────────────
-
 with tab_excel:
-    st.caption("F-02: Excel内の業績/KPI数値とグラフを動的に連動します。")
-
-    excel_data = ir_db.get_project_excel_data(project_id)
-
     if excel_data.empty:
         st.info("Excelデータがありません。先にファイルをアップロードしてください。")
         st.link_button("アップロードページへ", f"/IR_Upload?project_id={project_id}")
     else:
-        # データセット選択
-        data_options = {
-            f"{row['label']} (ID:{row['data_id']})": row["data_id"]
-            for _, row in excel_data.iterrows()
-        }
-        selected_data = st.selectbox(
-            "データセットを選択",
-            list(data_options.keys()),
-            key="excel_data_select",
-        )
-        data_id = data_options[selected_data]
-
-        # データ読み込み
-        row = excel_data[excel_data["data_id"] == data_id].iloc[0]
-        try:
-            records = json.loads(row["data_json"])
-            df = pd.DataFrame(records)
-
-            # データプレビュー
-            st.markdown("#### データプレビュー")
-            st.dataframe(df, use_container_width=True, height=200)
-
-            # グラフ生成用にデータを保持
-            analysis_df = df
-
-        except Exception as e:
-            st.error(f"データの読み込みに失敗しました: {e}")
-
-# ── タブ2: EDINETデータ ──────────────────────────────
+        st.caption(f"{len(excel_data)} 件のデータセットがあります。")
+        for _, row in excel_data.iterrows():
+            with st.expander(f"📄 {row['label']}（ID: {row['data_id']}）"):
+                try:
+                    records = json.loads(row["data_json"])
+                    df_preview = pd.DataFrame(records)
+                    st.dataframe(df_preview, use_container_width=True, height=150)
+                    st.caption(f"列: {', '.join(df_preview.columns)} | 行数: {len(df_preview)}")
+                except Exception as e:
+                    st.error(f"データ読み込みエラー: {e}")
 
 with tab_edinet:
-    st.caption("EDINETから取得した財務データを利用してグラフを生成します。")
-
-    sec_code = project.get("sec_code", "")
-    if not sec_code:
-        sec_code = st.text_input("証券コードを入力", placeholder="例: 7203", key="edinet_sec")
-
-    if sec_code:
-        edinet_fin = db.get_key_financials(sec_code)
-
-        if not edinet_fin.empty:
-            # 連結のみフィルタ
-            if 1 in edinet_fin["is_consolidated"].values:
-                edinet_fin = edinet_fin[edinet_fin["is_consolidated"] == 1]
-
-            edinet_fin = edinet_fin.sort_values("period_end")
-
-            # F-04: 直近5年間（20四半期）に制限
-            if len(edinet_fin) > 20:
-                edinet_fin = edinet_fin.tail(20)
-
-            # 億円変換
-            yen_cols = ["sales", "operating_income", "ordinary_income", "net_income",
-                        "total_assets", "net_assets",
-                        "operating_cf", "investing_cf", "financing_cf"]
-            for col in yen_cols:
-                if col in edinet_fin.columns:
-                    edinet_fin[col] = edinet_fin[col] / 1e8
-
-            st.markdown(f"#### {sec_code} の財務データ（直近5年間）")
-            st.dataframe(
-                edinet_fin[["period_end"] + [c for c in yen_cols if c in edinet_fin.columns]].rename(
-                    columns={
-                        "period_end": "期末", "sales": "売上高(億円)",
-                        "operating_income": "営業利益(億円)", "ordinary_income": "経常利益(億円)",
-                        "net_income": "純利益(億円)", "total_assets": "総資産(億円)",
-                        "net_assets": "純資産(億円)", "operating_cf": "営業CF(億円)",
-                        "investing_cf": "投資CF(億円)", "financing_cf": "財務CF(億円)",
-                    }
-                ),
-                use_container_width=True,
-                height=250,
-            )
-
-            analysis_df = edinet_fin
-        else:
-            st.warning(f"証券コード {sec_code} のデータが見つかりません。")
+    if sec_code and not edinet_df.empty:
+        st.markdown(f"#### {sec_code} の財務データ（直近5年間）")
+        st.dataframe(edinet_df, use_container_width=True, height=200)
+    elif sec_code:
+        st.warning(f"証券コード {sec_code} のEDINETデータが見つかりません。")
     else:
-        st.info("証券コードを入力するか、プロジェクトに証券コードを設定してください。")
+        st.info("プロジェクトに証券コードを設定するとEDINETデータを利用できます。")
 
-# ── F-02/F-06: グラフ生成＆同期 ──────────────────────
+# ══════════════════════════════════════════════════════
+#  セクション2: F-02 グラフマッピング設定
+# ══════════════════════════════════════════════════════
 
 st.divider()
-st.markdown("### グラフ生成・同期")
-st.caption("F-02: Excelデータと連動 / F-06: 5年スケーリング表示（グラフ高さ固定）")
+st.markdown("### F-02: グラフマッピング設定")
+st.caption(
+    "Excelのどのデータを、どのスライドのどのグラフに使うかを設定します。\n"
+    "Excel更新時にグラフ側が自動で最新化されます。"
+)
 
-if not analysis_df.empty:
-    # 数値列を自動検出
-    numeric_cols = analysis_df.select_dtypes(include="number").columns.tolist()
-    date_cols = [c for c in analysis_df.columns if any(
-        kw in str(c).lower() for kw in ["date", "period", "期", "年", "月"]
-    )]
+# データソース選択肢を構築
+data_source_options = {}
+for _, row in excel_data.iterrows():
+    data_source_options[f"Excel: {row['label']} (ID:{row['data_id']})"] = row["data_id"]
 
-    if not date_cols:
-        # 最初の非数値列をX軸候補に
-        non_numeric = [c for c in analysis_df.columns if c not in numeric_cols]
-        date_cols = non_numeric[:1] if non_numeric else []
+if excel_data.empty and edinet_df.empty:
+    st.info("マッピングにはデータソースが必要です。Excelをアップロードするか、証券コードを設定してください。")
+else:
+    # ── 新規マッピング追加フォーム ─────────────────────
 
-    x_axis = st.selectbox(
-        "X軸（期間）",
-        analysis_df.columns.tolist(),
-        index=analysis_df.columns.tolist().index(date_cols[0]) if date_cols else 0,
-        key="x_axis_select",
-    )
+    with st.expander("新しいグラフマッピングを追加", expanded=not excel_data.empty):
+        with st.form("add_mapping_form"):
+            st.markdown("**1. データソースを選択**")
+            if not data_source_options:
+                st.warning("Excelデータをアップロードしてください。")
+                st.form_submit_button("保存", disabled=True)
+            else:
+                selected_source = st.selectbox(
+                    "データソース",
+                    list(data_source_options.keys()),
+                    key="mapping_source",
+                )
+                selected_data_id = data_source_options[selected_source]
 
-    # グラフ種類選択
-    chart_type = st.radio(
-        "グラフタイプ",
-        ["売上・利益推移", "BS推移", "CF推移", "カスタム"],
-        horizontal=True,
-        key="chart_type",
-    )
+                # 選択されたデータの列を取得
+                sel_row = excel_data[excel_data["data_id"] == selected_data_id].iloc[0]
+                try:
+                    sel_records = json.loads(sel_row["data_json"])
+                    sel_df = pd.DataFrame(sel_records)
+                    sel_all_cols = sel_df.columns.tolist()
+                    sel_numeric_cols = sel_df.select_dtypes(include="number").columns.tolist()
+                except Exception:
+                    sel_all_cols = []
+                    sel_numeric_cols = []
 
-    # ── 売上・利益推移チャート ──
-    if chart_type == "売上・利益推移":
-        sales_col = st.selectbox(
-            "売上高の列", numeric_cols,
-            index=next((i for i, c in enumerate(numeric_cols) if "sales" in c.lower() or "売上" in c), 0),
-            key="sales_col",
-        )
-        profit_cols = st.multiselect(
-            "利益の列（複数選択可）", numeric_cols,
-            default=[c for c in numeric_cols if any(
-                kw in c.lower() for kw in ["operating", "net", "営業", "純"]
-            )][:2],
-            key="profit_cols",
-        )
+                st.markdown("**2. 配置先スライドとグラフ名を指定**")
+                col_slide, col_name = st.columns(2)
+                with col_slide:
+                    slide_number = st.number_input(
+                        "スライド番号", min_value=1, max_value=100, value=1,
+                        key="mapping_slide",
+                    )
+                with col_name:
+                    graph_name = st.text_input(
+                        "グラフ名",
+                        placeholder="例: 売上高・営業利益推移",
+                        key="mapping_graph_name",
+                    )
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
+                st.markdown("**3. グラフの種類と使用する列を選択**")
+                col_type, col_x = st.columns(2)
+                with col_type:
+                    graph_type = st.selectbox(
+                        "グラフタイプ",
+                        list(GRAPH_TYPE_OPTIONS.keys()),
+                        format_func=lambda x: GRAPH_TYPE_OPTIONS[x],
+                        key="mapping_graph_type",
+                    )
+                with col_x:
+                    x_column = st.selectbox(
+                        "X軸（期間列）",
+                        sel_all_cols,
+                        key="mapping_x_col",
+                    )
 
-        # F-06: 高さ制限を維持したスケーリング
-        fig.add_trace(
-            go.Bar(
-                x=analysis_df[x_axis], y=analysis_df[sales_col],
-                name=sales_col, marker_color="#1a73e8", opacity=0.7,
-            ),
-            secondary_y=False,
-        )
+                y_columns = st.multiselect(
+                    "Y軸（数値列）— 複数選択可",
+                    sel_numeric_cols,
+                    key="mapping_y_cols",
+                )
 
-        colors = ["#e53935", "#43a047", "#f9a825", "#7b1fa2"]
-        for i, col in enumerate(profit_cols):
-            fig.add_trace(
-                go.Scatter(
-                    x=analysis_df[x_axis], y=analysis_df[col],
-                    name=col, mode="lines+markers",
-                    line=dict(color=colors[i % len(colors)], width=3),
-                ),
-                secondary_y=True,
-            )
+                if graph_type == "bar_line":
+                    st.caption("棒＋折れ線: 最初のY軸列が棒グラフ、残りが折れ線になります。")
 
-        fig.update_layout(
-            title="売上高・利益推移",
-            height=CHART_HEIGHT_MAIN,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            margin=dict(t=80, b=40),
-        )
-        fig.update_yaxes(title_text=sales_col, secondary_y=False)
-        fig.update_yaxes(title_text="利益", secondary_y=True)
+                submitted = st.form_submit_button("マッピングを保存", type="primary",
+                                                   use_container_width=True)
+                if submitted:
+                    if not graph_name.strip():
+                        st.error("グラフ名を入力してください。")
+                    elif not y_columns:
+                        st.error("Y軸の列を1つ以上選択してください。")
+                    else:
+                        ir_db.save_graph_mapping(
+                            project_id=project_id,
+                            data_id=selected_data_id,
+                            slide_number=slide_number,
+                            graph_name=graph_name.strip(),
+                            graph_type=graph_type,
+                            x_column=x_column,
+                            y_columns=y_columns,
+                        )
+                        ir_db.add_notification(
+                            user_id, project_id, "mapping_saved",
+                            "グラフマッピング保存",
+                            f"スライド{slide_number}「{graph_name}」のマッピングを保存しました。",
+                        )
+                        st.success(f"スライド{slide_number}「{graph_name}」のマッピングを保存しました。")
+                        st.rerun()
 
-        st.plotly_chart(fig, use_container_width=True)
+# ══════════════════════════════════════════════════════
+#  セクション3: 保存済みマッピング一覧 & グラフプレビュー
+# ══════════════════════════════════════════════════════
 
-    # ── BS推移チャート ──
-    elif chart_type == "BS推移":
-        bs_cols = st.multiselect(
-            "BS項目を選択",
-            numeric_cols,
-            default=[c for c in numeric_cols if any(
-                kw in c.lower() for kw in ["assets", "資産", "純資産"]
-            )][:2],
-            key="bs_cols",
-        )
+st.divider()
+st.markdown("### 保存済みグラフマッピング")
+st.caption("F-02: Excelデータ更新時、ここに表示されるグラフも自動で最新化されます。")
 
-        if bs_cols:
-            fig = go.Figure()
-            colors = ["#1565c0", "#2e7d32", "#f9a825", "#7b1fa2"]
-            for i, col in enumerate(bs_cols):
-                fig.add_trace(go.Bar(
-                    x=analysis_df[x_axis], y=analysis_df[col],
-                    name=col, marker_color=colors[i % len(colors)],
-                ))
-            fig.update_layout(
-                title="BS推移",
-                barmode="group",
-                height=CHART_HEIGHT_SUB,
-                margin=dict(t=60, b=40),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+mappings = ir_db.get_project_graph_mappings(project_id)
 
-    # ── CF推移チャート ──
-    elif chart_type == "CF推移":
-        cf_cols = st.multiselect(
-            "CF項目を選択",
-            numeric_cols,
-            default=[c for c in numeric_cols if any(
-                kw in c.lower() for kw in ["cf", "キャッシュ", "cash"]
-            )][:3],
-            key="cf_cols",
-        )
+if mappings.empty:
+    st.info("グラフマッピングがまだありません。上のフォームから追加してください。")
+else:
+    # スライド番号順にグループ化
+    slide_numbers = sorted(mappings["slide_number"].unique())
 
-        if cf_cols:
-            fig = go.Figure()
-            colors = ["#1a73e8", "#e53935", "#f9a825"]
-            for i, col in enumerate(cf_cols):
-                fig.add_trace(go.Bar(
-                    x=analysis_df[x_axis], y=analysis_df[col],
-                    name=col, marker_color=colors[i % len(colors)],
-                ))
-            fig.update_layout(
-                title="キャッシュフロー推移",
-                barmode="group",
-                height=CHART_HEIGHT_SUB,
-                margin=dict(t=60, b=40),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    for slide_no in slide_numbers:
+        st.markdown(f"---")
+        st.markdown(f"## スライド {slide_no}")
 
-    # ── カスタムチャート ──
-    elif chart_type == "カスタム":
-        y_cols = st.multiselect(
-            "Y軸の列を選択（複数可）",
-            numeric_cols,
-            key="custom_y_cols",
-        )
+        slide_mappings = mappings[mappings["slide_number"] == slide_no]
 
-        custom_chart_style = st.radio(
-            "チャートスタイル",
-            ["折れ線", "棒グラフ", "エリア"],
-            horizontal=True,
-            key="custom_style",
-        )
+        for _, m in slide_mappings.iterrows():
+            col_chart, col_meta = st.columns([3, 1])
 
-        if y_cols:
-            fig = go.Figure()
-            colors = ["#1a73e8", "#e53935", "#43a047", "#f9a825", "#7b1fa2"]
-            for i, col in enumerate(y_cols):
-                if custom_chart_style == "折れ線":
-                    fig.add_trace(go.Scatter(
-                        x=analysis_df[x_axis], y=analysis_df[col],
-                        name=col, mode="lines+markers",
-                        line=dict(color=colors[i % len(colors)], width=3),
-                    ))
-                elif custom_chart_style == "棒グラフ":
-                    fig.add_trace(go.Bar(
-                        x=analysis_df[x_axis], y=analysis_df[col],
-                        name=col, marker_color=colors[i % len(colors)],
-                    ))
-                else:  # エリア
-                    fig.add_trace(go.Scatter(
-                        x=analysis_df[x_axis], y=analysis_df[col],
-                        name=col, mode="lines", fill="tonexty",
-                        line=dict(color=colors[i % len(colors)]),
-                    ))
+            with col_meta:
+                st.markdown(f"**{m['graph_name']}**")
+                st.caption(f"タイプ: {GRAPH_TYPE_OPTIONS.get(m['graph_type'], m['graph_type'])}")
+                st.caption(f"データ: {m['data_label']}")
+                st.caption(f"X軸: {m['x_column']}")
+                try:
+                    y_cols_list = json.loads(m["y_columns_json"])
+                    st.caption(f"Y軸: {', '.join(y_cols_list)}")
+                except Exception:
+                    y_cols_list = []
 
-            fig.update_layout(
-                title="カスタムチャート",
-                height=CHART_HEIGHT_MAIN,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                margin=dict(t=80, b=40),
-                barmode="group" if custom_chart_style == "棒グラフ" else None,
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                if st.button("削除", key=f"del_map_{m['mapping_id']}"):
+                    ir_db.delete_graph_mapping(m["mapping_id"])
+                    st.rerun()
 
-    # ── F-04: 長期トレンド分析 ───────────────────────
+            with col_chart:
+                # データを読み込んでグラフを描画
+                try:
+                    data_row = excel_data[excel_data["data_id"] == m["data_id"]]
+                    if not data_row.empty:
+                        records = json.loads(data_row.iloc[0]["data_json"])
+                        chart_df = pd.DataFrame(records)
 
-    st.divider()
-    st.markdown("### F-04: 長期トレンド分析（直近5年間）")
+                        if m["x_column"] in chart_df.columns and y_cols_list:
+                            valid_y = [c for c in y_cols_list if c in chart_df.columns]
+                            if valid_y:
+                                fig = _build_chart(
+                                    m["graph_type"], chart_df,
+                                    m["x_column"], valid_y,
+                                    title=f"スライド{slide_no}: {m['graph_name']}",
+                                    height=CHART_HEIGHT_SUB,
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.warning("Y軸の列がデータに見つかりません。")
+                        else:
+                            st.warning("マッピングの列がデータに存在しません。Excelを確認してください。")
+                    else:
+                        st.warning(f"データID {m['data_id']} が見つかりません。")
+                except Exception as e:
+                    st.error(f"グラフ描画エラー: {e}")
 
+# ══════════════════════════════════════════════════════
+#  セクション4: F-04 長期トレンド分析
+# ══════════════════════════════════════════════════════
+
+st.divider()
+st.markdown("### F-04: 長期トレンド分析（直近5年間）")
+
+# トレンド分析用のデータソース選択
+trend_source = st.radio(
+    "分析対象データ",
+    ["EDINET データ"] + [f"Excel: {row['label']}" for _, row in excel_data.iterrows()],
+    horizontal=True,
+    key="trend_source",
+)
+
+trend_df = pd.DataFrame()
+if trend_source == "EDINET データ" and not edinet_df.empty:
+    trend_df = edinet_df
+elif trend_source.startswith("Excel:"):
+    for _, row in excel_data.iterrows():
+        if f"Excel: {row['label']}" == trend_source:
+            try:
+                records = json.loads(row["data_json"])
+                trend_df = pd.DataFrame(records)
+            except Exception:
+                pass
+            break
+
+if not trend_df.empty:
     if st.button("トレンド分析を実行", type="primary"):
         with st.spinner("AI分析中..."):
-            trend = ai.generate_trend_analysis(analysis_df, period_years=5)
+            trend = ai.generate_trend_analysis(trend_df, period_years=5)
 
         st.markdown(f"**分析サマリー:** {trend['summary']}")
 
@@ -370,18 +413,17 @@ if not analysis_df.empty:
         if trend["outlook"]:
             st.info(f"**展望:** {trend['outlook']}")
 
-        # 分析完了通知
         ir_db.add_notification(
             user_id, project_id, "analysis_complete",
             "トレンド分析完了",
             "5年間の長期トレンド分析が完了しました。",
         )
-
-        # ステータス更新
         ir_db.update_project_status(project_id, "analyzing")
-
 else:
-    st.info("データソースを選択してください。上のタブからExcelまたはEDINETデータを選択できます。")
+    if trend_source == "EDINET データ":
+        st.info("EDINETデータがありません。プロジェクトの証券コードを確認してください。")
+    else:
+        st.info("データの読み込みに失敗しました。")
 
 # ── ナビゲーション ───────────────────────────────────
 
